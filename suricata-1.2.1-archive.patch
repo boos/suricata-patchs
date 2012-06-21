@@ -1,0 +1,232 @@
+diff -Nura /tmp/suricata-1.2.1/src/log-pcap.c suricata-1.2.1-orig/src/log-pcap.c
+--- /tmp/suricata-1.2.1/src/log-pcap.c	2012-01-20 16:17:30.000000000 +0100
++++ suricata-1.2.1-orig/src/log-pcap.c	2012-05-29 11:34:52.527401571 +0200
+@@ -63,6 +63,7 @@
+ 
+ #define LOGMODE_NORMAL                  0
+ #define LOGMODE_SGUIL                   1
++#define LOGMODE_ARCHIVE			2
+ 
+ #define RING_BUFFER_MODE_DISABLED       0
+ #define RING_BUFFER_MODE_ENABLED        1
+@@ -101,6 +102,12 @@
+     int timestamp_format;       /**< timestamp format sec or usec */
+     int use_stream_depth;       /**< use stream depth i.e. ignore packets that reach limit */
+     char dir[PATH_MAX];         /**< pcap log directory */
++
++    /* ARCHIVE related vars */
++    char *iface;                /**<iface where data are collected */
++    char hostname[HOST_NAME_MAX];/**<hostname of the current machine */
++    char tdir[PATH_MAX];        /**< temporary directory where file are dumped until they are closed */
++
+ } PcapLogData;
+ 
+ static PcapLogData *pl;         /**< pcap_dumper is not thread safe */
+@@ -241,6 +248,39 @@
+          }
+     }
+ 
++   /* if logmode is ARCHIVE move file actually closed in the destination directory from the temporary directory */
++    if ( pl->mode == LOGMODE_ARCHIVE)
++    {
++        char *dstdir = NULL;
++        unsigned int filename_path_size = 0;
++
++        /* Get the absolute path name of the last closed pcap filename */
++        if ((pf = TAILQ_FIRST(&pcap_file_list)) == NULL )
++            return -1;
++
++        /* Create reference to handle absolute dst path file */
++        filename_path_size = strlen(pl->dir) + strlen(basename(pf->filename));
++
++        dstdir = SCMalloc(filename_path_size * 2);
++        snprintf(dstdir, filename_path_size * 2, "%s/%s", pl->dir, basename(pf->filename));
++
++        /* move closed file from src to dest ! */
++        if ( rename(pf->filename, dstdir) )
++        {
++            SCLogError(SC_ERR_LOGPCAP_ARCHIVE_FILE_RENAME_FAILED, "log-pcap unable to move %s to %s: %s", pf->filename, pl->dir, strerror(errno));
++            return -1;
++        }
++
++        SCFree(dstdir);
++
++        pfnext = TAILQ_NEXT(pf,next);
++        TAILQ_REMOVE(&pcap_file_list, pf, next);
++
++        if ( pf != NULL )
++            free(pf);
++    }
++
++
+     if (PcapLogOpenFileCtx(pl) < 0) {
+         SCLogError(SC_ERR_FOPEN, "opening new pcap log file failed");
+         return -1;
+@@ -453,14 +493,18 @@
+     if (conf != NULL) {
+         const char *s_mode = NULL;
+         s_mode = ConfNodeLookupChildValue(conf, "mode");
+-        if (s_mode != NULL) {
+-            if (strcasecmp(s_mode, "sguil") == 0) {
++        if (s_mode != NULL) 
++	    {
++            if (strcasecmp(s_mode, "sguil") == 0) 
+                 pl->mode = LOGMODE_SGUIL;
+-            } else if (strcasecmp(s_mode, "normal") != 0) {
++    	    else if ( strcasecmp(s_mode, "archive") == 0 )
++	    	    pl->mode = LOGMODE_ARCHIVE;
++            else if (strcasecmp(s_mode, "normal") != 0) 
++		    {
+                 SCLogError(SC_ERR_INVALID_ARGUMENT,
+-                    "log-pcap you must specify \"sguil\" or \"normal\" mode "
+-                    "option to be set.");
+-                exit(EXIT_FAILURE);
++                        "log-pcap you must specify \"sguil\" or \"normal\" or \"archive\" mode "
++                        "option to be set.");
++                    exit(EXIT_FAILURE);
+             }
+         }
+ 
+@@ -478,7 +522,72 @@
+                     "log-pcap \"sguil\" mode requires \"sguil-base-dir\" "
+                     "option to be set.");
+                 exit(EXIT_FAILURE);
+-            } else {
++            } 
++
++            else 
++                /* LOGMODE_ARCHIVE configuration related variables allocation */
++                if (pl->mode == LOGMODE_ARCHIVE) {
++                    /* get temporary directory path */
++                    s_dir = ConfNodeLookupChildValue(conf, "archive_temp_dir");
++                    if ( s_dir == NULL ) {
++                        SCLogError(SC_ERR_LOGPCAP_ARCHIVE_TEMP_DIR_MISSING, 
++                        "log-pcap \"ARCHIVE\" mode requires" 
++                        " \"archive_temp_dir\" option to be set.");
++                        exit(EXIT_FAILURE);
++                    }
++                    if (!PathIsAbsolute(s_dir)) {
++                        SCLogError(
++                        SC_ERR_LOGPCAP_ARCHIVE_ABSOLUTE_PATH_DIR_REQUIRED, 
++                        "log-pcap \"ARCHIVE\" mode requires "
++                        "only absolute path dir to be set.");
++                        exit(EXIT_FAILURE);
++                    }
++                    if ( access(s_dir, R_OK | W_OK | X_OK ) )
++                    {
++                        SCLogError(
++                        SC_ERR_LOGPCAP_ARCHIVE_TEMP_DIR_MISSING, 
++                        "log-pcap \"ARCHIVE\" mode requires temp directory"
++                        "\"%s\" accessible, writable.", s_dir);
++                        exit(EXIT_FAILURE);
++                    }
++                    strlcpy(pl->tdir, s_dir, sizeof pl->tdir);
++
++                    /* get destination directory path */
++                    s_dir = ConfNodeLookupChildValue(conf, "archive_dest_dir");
++                    if ( s_dir == NULL )
++                    {
++                        SCLogError(SC_ERR_LOGPCAP_ARCHIVE_TEMP_DIR_MISSING, 
++                        "log-pcap \"ARCHIVE\""
++                        "mode requires \"archive_temp_dir\" option to be set.");
++                        exit(EXIT_FAILURE);
++                    }
++                    if (!PathIsAbsolute(s_dir))
++                    {
++                        SCLogError(
++                        SC_ERR_LOGPCAP_ARCHIVE_ABSOLUTE_PATH_DIR_REQUIRED, 
++                        "log-pcap \"ARCHIVE\" mode requires only absolute "
++                        "path dir to be set.");
++                        exit(EXIT_FAILURE);
++                    }
++                    if ( access(s_dir, R_OK | W_OK | X_OK ) )
++                    {
++                        SCLogError(
++                        SC_ERR_LOGPCAP_ARCHIVE_TEMP_DIR_MISSING, 
++                        "log-pcap \"ARCHIVE\" mode requires dump directory"
++                        "\"%s\" accessible, writable.", s_dir);
++                        exit(EXIT_FAILURE);
++                    }
++                    strlcpy(pl->dir, s_dir, sizeof pl->dir);
++
++                    if ( gethostname(pl->hostname, HOST_NAME_MAX) )
++                    {
++                        SCLogError(SC_ERR_LOGPCAP_ARCHIVE_HOSTNAME_REQUIRED,
++                        "log-pcap \"ARCHIVE\" mode requires that the machine"
++                        " have a valid hostname.");
++                        exit(EXIT_FAILURE);
++                    }
++                }
++            else {
+                 char *log_dir = NULL;
+                 if (ConfGet("default-log-dir", &log_dir) != 1)
+                     log_dir = DEFAULT_LOG_DIR;
+@@ -511,10 +620,23 @@
+         }
+     }
+ 
+-    SCLogInfo("using %s logging", pl->mode == LOGMODE_SGUIL ?
+-            "Sguil compatible" : "normal");
++    switch(pl->mode)
++    {
++    case LOGMODE_NORMAL:
++        SCLogInfo("using normal logging");
++        break;
++
++    case LOGMODE_SGUIL:
++        SCLogInfo("using Sguil compatible logging");
++        break;
++
++    case LOGMODE_ARCHIVE:
++        SCLogInfo("using ARCHIVE compatible logging");
++        break;
++    }
+ 
+     uint32_t max_file_limit = DEFAULT_FILE_LIMIT;
++
+     if (conf != NULL) {
+         const char *max_number_of_files_s = NULL;
+         max_number_of_files_s = ConfNodeLookupChildValue(conf, "max-files");
+@@ -663,7 +785,27 @@
+             snprintf(filename, PATH_MAX, "%s/%s.%" PRIu32 ".%" PRIu32, dirfull, pl->prefix, (uint32_t)ts.tv_sec, (uint32_t)ts.tv_usec);
+         }
+ 
+-    } else {
++    } 
++    /* ARCHIVE filename creation convention */
++    else if ( pl->mode == LOGMODE_ARCHIVE )
++    {
++        struct tm local_tm;
++
++        if ((pf->dirname = SCStrdup(pl->tdir)) == NULL )
++        {
++            SCLogError(SC_ERR_MEM_ALLOC, "pcap-log \"ARCHIVE\" mode "
++            "Error allocating memory for temporary directory name");
++            return -1;
++        }
++
++        localtime_r(&ts.tv_sec, &local_tm);
++        snprintf(pl->filename, PATH_MAX,
++           "%s/%s-%04d%02d%02d-%02d%02d%02d.pcap", 
++            pf->dirname, pl->hostname, local_tm.tm_year + 1900, 
++            local_tm.tm_mon +1, local_tm.tm_mday,
++            local_tm.tm_hour, local_tm.tm_min, local_tm.tm_sec);
++    }
++    else {
+         /* create the filename to use */
+         if (pl->timestamp_format == TS_FORMAT_SEC) {
+             snprintf(filename, PATH_MAX, "%s/%s.%" PRIu32, pl->dir, pl->prefix, (uint32_t)ts.tv_sec);
+diff -Nura /tmp/suricata-1.2.1/src/util-error.h suricata-1.2.1-orig/src/util-error.h
+--- /tmp/suricata-1.2.1/src/util-error.h	2012-01-20 16:17:30.000000000 +0100
++++ suricata-1.2.1-orig/src/util-error.h	2012-05-29 11:21:24.424788208 +0200
+@@ -213,6 +213,10 @@
+     SC_ERR_HTTP_COOKIE_INCOMPATIBLE_WITH_RAWBYTES,
+     SC_ERR_HTTP_COOKIE_RELATIVE_MISSING,
+     SC_ERR_LOGPCAP_SGUIL_BASE_DIR_MISSING,
++	SC_ERR_LOGPCAP_ARCHIVE_FILE_RENAME_FAILED,
++	SC_ERR_LOGPCAP_ARCHIVE_TEMP_DIR_MISSING,
++	SC_ERR_LOGPCAP_ARCHIVE_ABSOLUTE_PATH_DIR_REQUIRED,
++	SC_ERR_LOGPCAP_ARCHIVE_HOSTNAME_REQUIRED,
+     SC_ERR_UNKNOWN_DECODE_EVENT,
+     SC_ERR_RUNMODE,
+     SC_ERR_SHUTDOWN,
